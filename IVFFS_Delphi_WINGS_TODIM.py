@@ -476,7 +476,7 @@ def ivffs_todim_module():
 
     with st.sidebar:
         st.subheader("⚙️ TODIM Settings")
-        dombi_p = st.number_input("Dombi parameter p (same aggregation)", min_value=1.0, value=96.0, step=1.0, key="t_dombi_p")
+        dombi_p = st.number_input("Dombi parameter p (same aggregation)", min_value=0.5, value=96.0, step=1.0, key="t_dombi_p")
         theta = st.number_input("Loss attenuation θ", min_value=0.01, value=1.0, step=0.05, key="t_theta")
         alpha = st.number_input("Shape α", min_value=0.1, value=1.0, step=0.1, key="t_alpha")
 
