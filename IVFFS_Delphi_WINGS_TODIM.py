@@ -25,7 +25,7 @@ def format_ivffs(v):
     return f"([{muL:.6f},{muU:.6f}],[{nuL:.6f},{nuU:.6f}])"
 
 # =========================================================
-# IVFFDWA (Dombi-based) AGGREGATION (Excel-matching)
+# IVFFDWA (Dombi-based) AGGREGATION
 # Membership bounds (mu):
 #   a = ( 1 - 1/(1 + ( Σ λi * ( (x_i^3/(1-x_i^3))^α ) )^(1/α) ) ) )^(1/3)
 # Nonmembership bounds (nu):
@@ -84,10 +84,10 @@ def ivffs_score(v):
     return 0.5 * (0.5 * (muL**3 + muU**3 - nuL**3 - nuU**3) + 1.0)
 
 # =========================================================
-# WINGS LINGUISTIC SCALES (YOUR REQUIRED TABLES)
+# WINGS LINGUISTIC SCALES
 # =========================================================
 
-# Table A1: Strength evaluation (Biswas et al., 2023)
+Strength evaluation
 WINGS_STRENGTH = {
     "VLI": make_ivffs(0.10, 0.20, 0.80, 0.90),
     "LI":  make_ivffs(0.20, 0.50, 0.70, 0.80),
@@ -102,8 +102,7 @@ WINGS_STRENGTH_FULL = {
     "HI":  "High Important",
     "VHI": "Very High Important",
 }
-
-# Table A4: Influence evaluation (Seikh & Mandal, 2023)
+Influence evaluation
 WINGS_INFLUENCE = {
     "ELI": make_ivffs(0.05, 0.15, 0.85, 0.95),
     "VLI": make_ivffs(0.15, 0.25, 0.75, 0.85),
@@ -124,7 +123,7 @@ WINGS_INFLUENCE_FULL = {
 }
 
 # =========================================================
-# TODIM LINGUISTIC SCALE (VP…VG) (your required one)
+# TODIM LINGUISTIC SCALE (VP…VG)
 # =========================================================
 
 TODIM_LINGUISTIC = {
@@ -167,10 +166,6 @@ def round_df(df: pd.DataFrame, d=6):
         if pd.api.types.is_numeric_dtype(out[c]):
             out[c] = out[c].round(d)
     return out
-
-# =========================================================
-# IMPORTANT FIX: SYNC SESSION STATE TABLES WITH CURRENT COMPS
-# =========================================================
 
 def sync_strength_df(old_df: pd.DataFrame, comps: list[str]):
     """
@@ -512,7 +507,7 @@ def ivffs_todim_module():
                 use_container_width=True
             )
 
-            # Normalize (paper rule)
+            # Normalize
             norm = {}
             for j, c in enumerate(crits):
                 for a in alts:
