@@ -394,9 +394,9 @@ def ivffs_wings_module():
 
 def ivffs_todim_module():
     st.header("📌 IVFFS-TODIM")
-    st.caption("VP…VG scale + IVFFDWA aggregation + normalization (Benefit keep, Cost swap μ↔ν)")
+    st.caption("Evaluation + IVFFDWA aggregation + Normalization ")
 
-    with st.expander("TODIM Linguistic scale (VP…VG)"):
+    with st.expander("TODIM Linguistic Scale (VP…VG)"):
         st.dataframe(
             pd.DataFrame([{"Code":k, "Meaning":TODIM_FULL[k], "IVFFS":format_ivffs(v)}
                           for k,v in TODIM_LINGUISTIC.items()]),
