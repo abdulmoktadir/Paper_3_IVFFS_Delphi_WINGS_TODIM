@@ -207,7 +207,7 @@ def sync_influence_df(old_df: pd.DataFrame, comps: list[str]):
 
 def ivffs_wings_module():
     st.header("📌 IVFFS-WINGS")
-    st.caption("Strength (Biswas et al., 2023) + Influence (Seikh & Mandal, 2023) + IVFFDWA aggregation")
+    st.caption("Strength + Influence  + IVFFDWA aggregation")
 
     with st.expander("Strength scale (Table A1)"):
         st.dataframe(
