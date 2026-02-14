@@ -1,623 +1,748 @@
-import streamlit as st
+import io
+import base64
+import math
 import numpy as np
 import pandas as pd
-import math
-import io
+import streamlit as st
+
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# graphviz is optional on some deployments (binary may be missing)
+try:
+    import graphviz
+    GRAPHVIZ_OK = True
+except Exception:
+    GRAPHVIZ_OK = False
+
 
 # =========================================================
-# Interval-Valued Fermatean Fuzzy Set (IVFFS)
-#  A = ([muL, muU], [nuL, nuU]), q=3 (Fermatean)
+# Helpers: Safe display formatting (FIXES YOUR ERROR)
 # =========================================================
+def safe_numeric_style(df: pd.DataFrame, precision: int = 6):
+    """
+    Streamlit sometimes crashes when Styler.format is applied to mixed types.
+    This formats ONLY numeric columns; leaves others unchanged.
+    """
+    df2 = df.copy()
+    num_cols = df2.select_dtypes(include=[np.number]).columns
+    # avoid Styler on huge tables if you want; but we keep it safe
+    sty = df2.style
+    if len(num_cols) > 0:
+        fmt = "{:." + str(precision) + "f}"
+        sty = sty.format({c: fmt for c in num_cols})
+    return sty
 
-EPS = 1e-12
-Q = 3  # Fermatean
+
+# =========================================================
+# IVFFS representation
+# We treat an IVFF number as (mu_L, mu_U, nu_L, nu_U)
+# =========================================================
+IVFF = tuple[float, float, float, float]
+
 
 def clamp01(x: float) -> float:
-    return float(min(1.0, max(0.0, x)))
+    return max(0.0, min(1.0, float(x)))
 
-def sanitize_ivffs(muL, muU, nuL, nuU):
-    """Clamp to [0,1], enforce ordering, and (soft) Fermatean feasibility mu^3 + nu^3 <= 1."""
-    muL, muU = clamp01(muL), clamp01(muU)
-    nuL, nuU = clamp01(nuL), clamp01(nuU)
-    if muL > muU:
-        muL, muU = muU, muL
-    if nuL > nuU:
-        nuL, nuU = nuU, nuL
 
-    # Soft feasibility: ensure upper bounds don't violate mu^q + nu^q <= 1.
-    # If violated, shrink nuU (then nuL if needed).
-    def fix(mu, nu):
-        s = mu**Q + nu**Q
-        if s <= 1.0 + 1e-10:
-            return mu, nu
-        # reduce nu to satisfy: nu^Q <= 1 - mu^Q
-        target = max(0.0, 1.0 - mu**Q)
-        nu_new = target ** (1.0 / Q)
-        return mu, nu_new
+def make_ivff(mu_l, mu_u, nu_l, nu_u) -> IVFF:
+    mu_l, mu_u, nu_l, nu_u = map(clamp01, [mu_l, mu_u, nu_l, nu_u])
+    if mu_l > mu_u:
+        mu_l, mu_u = mu_u, mu_l
+    if nu_l > nu_u:
+        nu_l, nu_u = nu_u, nu_l
+    return (mu_l, mu_u, nu_l, nu_u)
 
-    muU, nuU = fix(muU, nuU)
-    muL, nuL = fix(muL, nuL)
 
-    # re-order again after fix
-    muL, muU = min(muL, muU), max(muL, muU)
-    nuL, nuU = min(nuL, nuU), max(nuL, nuU)
+def ivff_to_str(x: IVFF, nd: int = 4) -> str:
+    mu_l, mu_u, nu_l, nu_u = x
+    return f"([{{:.{nd}f}}, {{:.{nd}f}}], [{{:.{nd}f}}, {{:.{nd}f}}])".format(mu_l, mu_u, nu_l, nu_u)
 
-    return (muL, muU, nuL, nuU)
 
-def ivffs_str(a):
-    muL, muU, nuL, nuU = a
-    return f"([μL={muL:.5f}, μU={muU:.5f}], [νL={nuL:.5f}, νU={nuU:.5f}])"
+def parse_ivff_str(s: str) -> IVFF | None:
+    """
+    Parses strings like: ([0.05,0.15],[0.85,0.95])
+    """
+    try:
+        t = (
+            s.strip()
+            .replace("(", "")
+            .replace(")", "")
+            .replace("[", "")
+            .replace("]", "")
+            .replace(" ", "")
+        )
+        parts = t.split(",")
+        if len(parts) != 4:
+            return None
+        a, b, c, d = map(float, parts)
+        return make_ivff(a, b, c, d)
+    except Exception:
+        return None
+
 
 # =========================================================
-# Dombi-type IVFFS weighted aggregation (IVFFDWA-style)
-# (We implement a stable, q=3 version widely used for q-rung/fermatean operators.)
+# IVFFS crisp functions
+# (Fermatean-style score; works for ranking/defuzz)
 # =========================================================
+def score_ivff(x: IVFF) -> float:
+    """
+    A practical IVFFS score (Fermatean-style):
+      S = avg(mu^3) - avg(nu^3)
+    Range approx [-1, 1]
+    """
+    mu_l, mu_u, nu_l, nu_u = x
+    mu = (mu_l**3 + mu_u**3) / 2.0
+    nu = (nu_l**3 + nu_u**3) / 2.0
+    return mu - nu
 
-def dombi_agg_mu(values, weights, alpha=2.0):
-    """
-    Membership aggregation:
-      mu = [1 / (1 + (Σ w_k * ((1 - v^q)/(v^q))^alpha)^(1/alpha))]^(1/q)
-    """
-    alpha = float(alpha)
-    s = 0.0
-    for v, w in zip(values, weights):
-        v = max(EPS, min(1.0 - EPS, float(v)))
-        t = ((1.0 - v**Q) / (v**Q)) ** alpha
-        s += float(w) * t
-    s = max(EPS, s)
-    inner = s ** (1.0 / alpha)
-    out = (1.0 / (1.0 + inner)) ** (1.0 / Q)
-    return clamp01(out)
 
-def dombi_agg_nu(values, weights, alpha=2.0):
+def exp_value_ivff(x: IVFF) -> float:
     """
-    Non-membership aggregation:
-      nu = [( (Σ w_k * ((v^q)/(1 - v^q))^alpha)^(1/alpha) ) / (1 + (Σ...)^(1/alpha)) ]^(1/q)
+    Expected value proxy used for DEMATEL/WINGS crisp matrix:
+      EV = avg(mu)
+    Range [0,1]
     """
-    alpha = float(alpha)
-    s = 0.0
-    for v, w in zip(values, weights):
-        v = max(EPS, min(1.0 - EPS, float(v)))
-        t = ((v**Q) / (1.0 - v**Q)) ** alpha
-        s += float(w) * t
-    s = max(EPS, s)
-    inner = s ** (1.0 / alpha)
-    out = (inner / (1.0 + inner)) ** (1.0 / Q)
-    return clamp01(out)
+    mu_l, mu_u, _, _ = x
+    return (mu_l + mu_u) / 2.0
 
-def ivffdwa_aggregate(ivffs_list, weights, alpha=2.0):
+
+# =========================================================
+# IVFFS aggregation (expert aggregation)
+# =========================================================
+def ivff_weighted_aggregate(ivffs: list[IVFF], weights: list[float]) -> IVFF:
     """
-    Aggregate a list of IVFFSs using Dombi-type operator, applied to each bound.
+    Robust weighted aggregation for IVFF:
+      mu = (sum w * mu^3)^(1/3)
+      nu = (sum w * nu^3)^(1/3)
+    applied to lower/upper separately.
     """
-    wsum = sum(weights)
-    if wsum <= 0:
-        weights = [1.0 / len(weights)] * len(weights)
+    if len(ivffs) == 0:
+        return make_ivff(0, 0, 0, 0)
+
+    w = np.array(weights, dtype=float)
+    if w.sum() == 0:
+        w = np.ones_like(w) / len(w)
     else:
-        weights = [w / wsum for w in weights]
+        w = w / w.sum()
 
-    muL_list = [x[0] for x in ivffs_list]
-    muU_list = [x[1] for x in ivffs_list]
-    nuL_list = [x[2] for x in ivffs_list]
-    nuU_list = [x[3] for x in ivffs_list]
+    mu_l = (np.sum(w * np.array([x[0] ** 3 for x in ivffs])) ) ** (1/3)
+    mu_u = (np.sum(w * np.array([x[1] ** 3 for x in ivffs])) ) ** (1/3)
+    nu_l = (np.sum(w * np.array([x[2] ** 3 for x in ivffs])) ) ** (1/3)
+    nu_u = (np.sum(w * np.array([x[3] ** 3 for x in ivffs])) ) ** (1/3)
 
-    muL = dombi_agg_mu(muL_list, weights, alpha)
-    muU = dombi_agg_mu(muU_list, weights, alpha)
-    nuL = dombi_agg_nu(nuL_list, weights, alpha)
-    nuU = dombi_agg_nu(nuU_list, weights, alpha)
+    return make_ivff(mu_l, mu_u, nu_l, nu_u)
 
-    return sanitize_ivffs(muL, muU, nuL, nuU)
 
 # =========================================================
-# Score function (paper-consistent form; yields [0,1])
-#   Ψ(A) = 0.5 * ( 0.5*(muL^3 + muU^3 - nuL^3 - nuU^3) + 1 )
+# Load linguistic scales from your Excel template
+# (sheet: "Experts Data" in your uploaded workbook)
 # =========================================================
+def load_scales_from_excel(xlsx_file) -> dict:
+    """
+    Expected layout (matches your template):
+      - Influence assessment table around T3 / U4
+      - Strength (relevance) table around U18
+      - TODIM linguistic table around U4 (same area in many templates)
 
-def ivffs_score(a):
-    muL, muU, nuL, nuU = a
-    val = 0.5 * (0.5 * (muL**Q + muU**Q - nuL**Q - nuU**Q) + 1.0)
-    return float(val)
+    We detect by scanning for abbreviations + numeric columns a,b,c,d.
+    """
+    import openpyxl
 
-# =========================================================
-# Normalization for benefit vs cost criteria
-#   Benefit: keep IVFFS as-is
-#   Cost: swap membership and non-membership intervals
-#         ([muL,muU],[nuL,nuU]) -> ([nuL,nuU],[muL,muU])
-# =========================================================
+    wb = openpyxl.load_workbook(xlsx_file, data_only=False)
+    if "Experts Data" not in wb.sheetnames:
+        raise ValueError("Excel must contain a sheet named 'Experts Data'.")
 
-def normalize_ivffs_benefit_cost(a, crit_type: str):
-    muL, muU, nuL, nuU = a
-    if crit_type.lower().startswith("c"):  # Cost
-        return sanitize_ivffs(nuL, nuU, muL, muU)
-    return sanitize_ivffs(muL, muU, nuL, nuU)
+    ws = wb["Experts Data"]
 
-# =========================================================
-# Default Linguistic Scales (editable in UI)
-# NOTE: You can overwrite these to match Appendix tables exactly.
-# =========================================================
+    # Read a large rectangular area and locate tables by headers
+    # We'll just scan rows to find any row that contains: ["a","b","c","d"]
+    max_row = min(ws.max_row, 400)
+    max_col = min(ws.max_column, 80)
 
-DEFAULT_WINGS_STRENGTH = {
-    "VLR": (0.00, 0.10, 0.85, 0.95),
-    "LR" : (0.10, 0.25, 0.65, 0.80),
-    "MR" : (0.25, 0.45, 0.45, 0.65),
-    "HR" : (0.45, 0.70, 0.25, 0.45),
-    "VHR": (0.70, 0.90, 0.05, 0.25),
-}
-
-DEFAULT_WINGS_INFLUENCE = {
-    "ELI": (0.00, 0.10, 0.85, 0.95),
-    "VLI": (0.10, 0.20, 0.70, 0.85),
-    "LI" : (0.20, 0.35, 0.55, 0.70),
-    "MI" : (0.35, 0.55, 0.40, 0.55),
-    "HI" : (0.55, 0.70, 0.25, 0.40),
-    "VHI": (0.70, 0.82, 0.12, 0.25),
-    "EHI": (0.82, 0.92, 0.05, 0.12),
-}
-
-DEFAULT_TODIM_SCALE = {
-    "VP": (0.00, 0.10, 0.85, 0.95),
-    "P" : (0.10, 0.25, 0.65, 0.80),
-    "MP": (0.25, 0.40, 0.50, 0.65),
-    "F" : (0.40, 0.55, 0.35, 0.50),
-    "MG": (0.55, 0.70, 0.20, 0.35),
-    "G" : (0.70, 0.82, 0.10, 0.20),
-    "VG": (0.82, 0.92, 0.05, 0.12),
-}
-
-# =========================================================
-# Utilities: Scale editor + parsing
-# =========================================================
-
-def scale_dict_to_df(scale: dict):
     rows = []
-    for k, v in scale.items():
-        muL, muU, nuL, nuU = v
-        rows.append({"Term": k, "muL": muL, "muU": muU, "nuL": nuL, "nuU": nuU})
-    return pd.DataFrame(rows)
+    for r in range(1, max_row + 1):
+        row = []
+        for c in range(1, max_col + 1):
+            row.append(ws.cell(r, c).value)
+        rows.append(row)
 
-def df_to_scale_dict(df: pd.DataFrame):
-    out = {}
-    for _, r in df.iterrows():
-        term = str(r["Term"]).strip()
-        if not term:
-            continue
-        out[term] = sanitize_ivffs(float(r["muL"]), float(r["muU"]), float(r["nuL"]), float(r["nuU"]))
-    return out
+    df = pd.DataFrame(rows)
 
-def ensure_square_matrix(n, fill="ELI"):
-    return [[fill for _ in range(n)] for _ in range(n)]
+    def find_header_row(header_tokens=("a", "b", "c", "d")):
+        for i in range(len(df)):
+            row = df.iloc[i].astype(str).str.lower().tolist()
+            if all(tok in row for tok in header_tokens):
+                return i
+        return None
+
+    # Influence table: usually has "Influence assessement" and "ELI, VLI..."
+    # Strength table: usually has "Strength/relevance assessement" and "VLR..."
+    # TODIM table: usually has "Linguistic assessment" and letters (a,b,c,d)
+
+    influence_map = {}
+    strength_map = {}
+    todim_map = {}
+
+    # Scan for known abbreviations and pick their numeric columns
+    def grab_table_by_abbr(abbr_list):
+        mapping = {}
+        for i in range(len(df)):
+            row = df.iloc[i].tolist()
+            for j, val in enumerate(row):
+                if val in abbr_list:
+                    # try read a,b,c,d in next columns (common)
+                    # find numeric candidates in row
+                    nums = []
+                    for k in range(j + 1, min(j + 10, df.shape[1])):
+                        v = row[k]
+                        if isinstance(v, (int, float)) and not pd.isna(v):
+                            nums.append(float(v))
+                    if len(nums) >= 4:
+                        mapping[str(val)] = make_ivff(nums[0], nums[1], nums[2], nums[3])
+        return mapping
+
+    influence_map = grab_table_by_abbr(["ELI", "VLI", "LI", "MI", "HI", "VHI", "EHI"])
+    strength_map = grab_table_by_abbr(["VLR", "LR", "MR", "HR", "VHR"])
+
+    # TODIM linguistic terms in your earlier snippets (example: "MG", "G"...)
+    # Your template may include different ones; we also capture generic 2-letter codes.
+    todim_map = grab_table_by_abbr(["VP", "P", "MP", "F", "MG", "G", "VG", "VB", "MB", "M", "EB", "EG"])
+
+    return {
+        "influence": influence_map,
+        "strength": strength_map,
+        "todim": todim_map,
+    }
+
 
 # =========================================================
-# IVFFS-WINGS Module
+# WINGS (crisp DEMATEL-like core, with IVFFS inputs)
 # =========================================================
+def wings_compute(
+    component_names: list[str],
+    strengths_by_expert: list[list[IVFF]],
+    influence_by_expert: list[list[list[IVFF]]],
+    expert_weights: list[float],
+):
+    n = len(component_names)
+    m = len(strengths_by_expert)
 
-def ivffs_wings_module():
-    st.header("📊 IVFFS–WINGS")
+    # Aggregate expert IVFFS matrices
+    agg_strength = []
+    for i in range(n):
+        ivffs = [strengths_by_expert[e][i] for e in range(m)]
+        agg_strength.append(ivff_weighted_aggregate(ivffs, expert_weights))
 
-    st.caption("Workflow: aggregate IVFFS-SIM → score matrix C → normalized SIM N → total SIM T → TI/TR → weights.")
-    c1, c2 = st.columns(2)
-    n = c1.number_input("Number of components", min_value=2, max_value=30, value=5, step=1)
-    mexp = c2.number_input("Number of experts", min_value=1, max_value=20, value=4, step=1)
+    agg_influence = [[make_ivff(0, 0, 0, 0) for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                agg_influence[i][j] = agg_strength[i]
+            else:
+                ivffs = [influence_by_expert[e][i][j] for e in range(m)]
+                agg_influence[i][j] = ivff_weighted_aggregate(ivffs, expert_weights)
 
-    # component names
-    comp_names = []
-    with st.expander("Component names", expanded=True):
-        cols = st.columns(min(5, n))
-        for i in range(n):
-            with cols[i % len(cols)]:
-                comp_names.append(st.text_input(f"C{i+1}", value=f"ESG{i+1}", key=f"w_comp_{i}"))
+    # Build crisp direct matrix D using expected value of IVFF
+    D = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        for j in range(n):
+            D[i, j] = exp_value_ivff(agg_influence[i][j])
 
-    # expert weights
-    st.subheader("Expert weights (sum = 1)")
-    if mexp == 1:
-        exp_w = [1.0]
-        st.info("Single expert → weight = 1.0")
+    # Normalize by max row sum (DEMATEL normalization)
+    row_sums = D.sum(axis=1)
+    s = row_sums.max() if row_sums.max() != 0 else 1.0
+    X = D / s
+
+    # Total relation matrix: T = X (I - X)^-1
+    I = np.eye(n)
+    try:
+        T = X @ np.linalg.inv(I - X)
+    except np.linalg.LinAlgError:
+        # fallback pseudo-inverse
+        T = X @ np.linalg.pinv(I - X)
+
+    TI = T.sum(axis=1)
+    TR = T.sum(axis=0)
+    engagement = TI + TR
+    role = TI - TR
+
+    # Weights from engagement (safe, stable)
+    w = engagement.copy()
+    w = np.maximum(w, 0.0)
+    w_sum = w.sum() if w.sum() != 0 else 1.0
+    weights = w / w_sum
+
+    out = pd.DataFrame({
+        "Component": component_names,
+        "TI": TI,
+        "TR": TR,
+        "Engagement": engagement,
+        "Role": role,
+        "Expected value": engagement,   # shown explicitly for your table naming
+        "Weight": weights
+    })
+
+    return {
+        "agg_strength": agg_strength,
+        "agg_influence": agg_influence,
+        "D": D,
+        "X": X,
+        "T": T,
+        "out": out
+    }
+
+
+# =========================================================
+# TODIM (crisp TODIM using IVFFS score)
+# =========================================================
+def todim_rank(
+    decision_scores: np.ndarray,   # m x n (normalized to [0,1])
+    weights: np.ndarray,           # n
+    theta: float = 1.0,
+    alpha: float = 1.0
+):
+    """
+    Standard TODIM-like dominance.
+    Uses reference criterion r = argmax(weights).
+    """
+    m, n = decision_scores.shape
+    w = weights.astype(float)
+    if w.sum() == 0:
+        w = np.ones(n) / n
     else:
-        exp_w = []
-        cols = st.columns(min(6, mexp))
-        for k in range(mexp):
-            with cols[k % len(cols)]:
-                exp_w.append(st.number_input(f"E{k+1}", min_value=0.0, max_value=1.0, value=round(1/mexp, 4), step=0.01, key=f"w_expw_{k}"))
-        if not np.isclose(sum(exp_w), 1.0):
-            st.error(f"Expert weights must sum to 1.0 (now {sum(exp_w):.6f}).")
-            st.stop()
+        w = w / w.sum()
 
-    # Scale editors
-    st.subheader("Linguistic scales (editable)")
-    st.write("If you want 1:1 Excel match, paste the exact IVFFS values from your Appendix tables here.")
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        st.markdown("**Strength/Relevance scale**")
-        df_strength = st.data_editor(
-            scale_dict_to_df(st.session_state.get("w_strength_scale", DEFAULT_WINGS_STRENGTH)),
-            hide_index=True,
-            use_container_width=True,
-            key="w_strength_scale_editor"
-        )
-        strength_scale = df_to_scale_dict(df_strength)
-        st.session_state["w_strength_scale"] = strength_scale
-    with sc2:
-        st.markdown("**Influence scale**")
-        df_infl = st.data_editor(
-            scale_dict_to_df(st.session_state.get("w_infl_scale", DEFAULT_WINGS_INFLUENCE)),
-            hide_index=True,
-            use_container_width=True,
-            key="w_infl_scale_editor"
-        )
-        infl_scale = df_to_scale_dict(df_infl)
-        st.session_state["w_infl_scale"] = infl_scale
+    r = int(np.argmax(w))
+    wr = w[r] if w[r] != 0 else 1e-9
 
-    alpha = st.number_input("Dombi parameter α", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
+    delta = np.zeros((m, m), dtype=float)
 
-    # Expert inputs
-    st.subheader("Expert inputs (Strengths + Influence Matrix)")
-    if "w_experts" not in st.session_state or len(st.session_state["w_experts"]) != mexp or st.session_state.get("w_n_cached") != n:
-        st.session_state["w_n_cached"] = n
-        st.session_state["w_experts"] = []
-        for e in range(mexp):
-            st.session_state["w_experts"].append({
-                "strength_terms": ["HR"] * n,
-                "influence_terms": ensure_square_matrix(n, fill="ELI"),
-            })
-
-    tabs = st.tabs([f"Expert {e+1}" for e in range(mexp)]) if mexp > 1 else [st.container()]
-    for e in range(mexp):
-        with tabs[e] if mexp > 1 else tabs[0]:
-            st.markdown("**Diagonal strengths (relevance)**")
-            cols = st.columns(min(6, n))
-            for i in range(n):
-                with cols[i % len(cols)]:
-                    cur = st.session_state["w_experts"][e]["strength_terms"][i]
-                    term = st.selectbox(
-                        comp_names[i],
-                        options=list(strength_scale.keys()),
-                        index=list(strength_scale.keys()).index(cur) if cur in strength_scale else 0,
-                        key=f"w_strength_{e}_{i}"
-                    )
-                    st.session_state["w_experts"][e]["strength_terms"][i] = term
-
-            st.markdown("**Influence matrix** (row → column). Diagonal is fixed by strengths.")
-            for i in range(n):
-                row = st.columns(n+1)
-                row[0].markdown(f"**{comp_names[i]}**")
-                for j in range(n):
-                    if i == j:
-                        row[j+1].markdown("—")
-                        continue
-                    cur = st.session_state["w_experts"][e]["influence_terms"][i][j]
-                    term = row[j+1].selectbox(
-                        f"{i}-{j}",
-                        options=list(infl_scale.keys()),
-                        index=list(infl_scale.keys()).index(cur) if cur in infl_scale else 0,
-                        key=f"w_infl_{e}_{i}_{j}"
-                    )
-                    st.session_state["w_experts"][e]["influence_terms"][i][j] = term
-
-    if st.button("✅ Run IVFFS–WINGS", type="primary", use_container_width=True):
-        # Build each expert IVFFS-SIM as IVFFS matrix (n x n)
-        expert_mats = []
-        for e in range(mexp):
-            mat = [[None]*n for _ in range(n)]
-            # diagonal strengths
-            for i in range(n):
-                mat[i][i] = strength_scale[st.session_state["w_experts"][e]["strength_terms"][i]]
-            for i in range(n):
-                for j in range(n):
-                    if i == j: 
-                        continue
-                    mat[i][j] = infl_scale[st.session_state["w_experts"][e]["influence_terms"][i][j]]
-            expert_mats.append(mat)
-
-        # Aggregate to eβ (aggregated IVFFS-SIM)
-        agg = [[None]*n for _ in range(n)]
-        for i in range(n):
+    for i in range(m):
+        for k in range(m):
+            if i == k:
+                continue
+            s = 0.0
             for j in range(n):
-                cell_list = [expert_mats[e][i][j] for e in range(mexp)]
-                agg[i][j] = ivffdwa_aggregate(cell_list, exp_w, alpha=alpha)
+                diff = decision_scores[i, j] - decision_scores[k, j]
+                if diff >= 0:
+                    s += (w[j] / wr) * (diff ** alpha)
+                else:
+                    # loss part
+                    wj = w[j] if w[j] != 0 else 1e-9
+                    s -= (1.0 / theta) * (wr / wj) * ((-diff) ** alpha)
+            delta[i, k] = s
 
-        # Score matrix C (Ceij)
-        C = np.zeros((n, n), dtype=float)
-        for i in range(n):
-            for j in range(n):
-                C[i, j] = ivffs_score(agg[i][j])
+    phi = delta.sum(axis=1)
+    # normalize to [0,1]
+    mn, mx = phi.min(), phi.max()
+    if mx - mn == 0:
+        xi = np.zeros_like(phi)
+    else:
+        xi = (phi - mn) / (mx - mn)
 
-        # scaling factor ς and normalized SIM N
-        zeta = float(np.sum(C))
-        if abs(zeta) < EPS:
-            zeta = 1.0
-        N = C / zeta
-
-        # Total relation matrix T = N (I - N)^(-1)
-        I = np.eye(n)
-        try:
-            T = N @ np.linalg.inv(I - N)
-        except np.linalg.LinAlgError:
-            T = N @ np.linalg.pinv(I - N)
-
-        TI = np.sum(T, axis=1)   # Eq (18)
-        TR = np.sum(T, axis=0)   # Eq (19)
-
-        engagement = TI + TR
-        role = TI - TR
-
-        # Eq (20)-(21): expected value and normalized weights
-        E = np.sqrt(engagement**2 + role**2)
-        w = E / (np.sum(E) if np.sum(E) > EPS else 1.0)
-
-        # persist for TODIM
-        st.session_state["wings_weights"] = w
-        st.session_state["wings_component_names"] = comp_names
-
-        st.success("WINGS computed.")
-
-        with st.expander("Aggregated IVFFS-SIM (eβ)", expanded=False):
-            df_agg = pd.DataFrame([[ivffs_str(agg[i][j]) for j in range(n)] for i in range(n)], index=comp_names, columns=comp_names)
-            st.dataframe(df_agg, use_container_width=True)
-
-        st.subheader("Score matrix C and normalized SIM N")
-        st.write("C = score(eβ), N = C / ς")
-        st.dataframe(pd.DataFrame(C, index=comp_names, columns=comp_names).style.format("{:.6f}"), use_container_width=True)
-        st.dataframe(pd.DataFrame(N, index=comp_names, columns=comp_names).style.format("{:.6f}"), use_container_width=True)
-
-        st.subheader("Total relation matrix T")
-        st.dataframe(pd.DataFrame(T, index=comp_names, columns=comp_names).style.format("{:.6f}"), use_container_width=True)
-
-        st.subheader("TI / TR / Engagement / Role / Expected value / Weight")
-        out = pd.DataFrame({
-            "Component": comp_names,
-            "TI": TI,
-            "TR": TR,
-            "TI+TR (Engagement)": engagement,
-            "TI-TR (Role)": role,
-            "E(ω)": E,
-            "ω (weight)": w
-        })
-        out["Group"] = np.where(out["TI-TR (Role)"] > 0, "Cause", "Effect")
-        st.dataframe(out.style.format("{:.6f}"), use_container_width=True, hide_index=True)
-
-        # download CSV
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download WINGS results (CSV)", data=csv, file_name="ivffs_wings_results.csv", mime="text/csv")
+    return phi, xi
 
 
 # =========================================================
-# IVFFS-TODIM Module
+# Word report export (WINGS)
 # =========================================================
+def make_word_report_wings(out_df: pd.DataFrame) -> Document:
+    doc = Document()
+    title = doc.add_heading("IVFFS–WINGS Report", 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-def todim_distance(a, b):
-    # τ values are crisp scores; paper uses d(τij, τqj) (we use absolute difference)
-    return abs(float(a) - float(b))
+    doc.add_paragraph("Results summary (TI / TR / Engagement / Role / Weight).")
 
-def ivffs_todim_module():
-    st.header("📈 IVFFS–TODIM")
+    table = doc.add_table(rows=1, cols=len(out_df.columns))
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    for i, c in enumerate(out_df.columns):
+        hdr[i].text = str(c)
 
-    st.caption("Workflow: (optional) normalize IVFFS by benefit/cost → score matrix τ → relative weights → dominance → superiority → rank.")
+    for _, row in out_df.iterrows():
+        r = table.add_row().cells
+        for i, c in enumerate(out_df.columns):
+            v = row[c]
+            if isinstance(v, (float, int, np.floating, np.integer)):
+                r[i].text = f"{float(v):.6f}"
+            else:
+                r[i].text = str(v)
 
-    c1, c2 = st.columns(2)
-    alts_in = c1.text_input("Alternatives (comma-separated)", "S1, S2, S3, S4, S5", key="t_alts")
-    crits_in = c2.text_input("Criteria (comma-separated)", "ESG1, ESG2, ESG3, ESG4", key="t_crits")
-    alternatives = [x.strip() for x in alts_in.split(",") if x.strip()]
-    criteria = [x.strip() for x in crits_in.split(",") if x.strip()]
-    if len(alternatives) < 2 or len(criteria) < 1:
-        st.warning("Need at least 2 alternatives and 1 criterion.")
+    return doc
+
+
+def word_download_link(doc: Document, filename="IVFFS_WINGS_Report.docx"):
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    b64 = base64.b64encode(bio.read()).decode()
+    href = f'<a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{filename}">Download Word Report</a>'
+    return href
+
+
+# =========================================================
+# UI: IVFFS–WINGS module
+# =========================================================
+def ivffs_wings_module():
+    st.header("🧩 IVFFS–WINGS")
+
+    st.info("Upload your Excel template to auto-load linguistic scales (recommended).")
+
+    up = st.file_uploader("Upload Excel (your template)", type=["xlsx"], key="ivffs_excel")
+    if up is None:
+        st.warning("Please upload your Excel template to proceed.")
         return
 
-    # Criteria types + weights
-    st.subheader("Criteria types & weights")
-    if "t_crit_df" not in st.session_state or set(st.session_state["t_crit_df"]["Criterion"]) != set(criteria):
-        w0 = [round(1/len(criteria), 6)] * len(criteria)
-        w0[-1] = 1.0 - sum(w0[:-1]) if len(criteria) > 0 else 1.0
-        st.session_state["t_crit_df"] = pd.DataFrame({
+    try:
+        scales = load_scales_from_excel(up)
+    except Exception as e:
+        st.error(f"Could not read scales from Excel: {e}")
+        return
+
+    strength_scale = scales["strength"]
+    influence_scale = scales["influence"]
+
+    if len(strength_scale) == 0 or len(influence_scale) == 0:
+        st.error("Scale tables not detected in Excel (Strength/Influence). Please ensure sheet 'Experts Data' contains them.")
+        return
+
+    with st.expander("Loaded Linguistic Scales", expanded=False):
+        st.write("**Strength terms**")
+        st.dataframe(pd.DataFrame(
+            [{"abbr": k, "ivff": ivff_to_str(v, 4)} for k, v in strength_scale.items()]
+        ), hide_index=True, use_container_width=True)
+        st.write("**Influence terms**")
+        st.dataframe(pd.DataFrame(
+            [{"abbr": k, "ivff": ivff_to_str(v, 4)} for k, v in influence_scale.items()]
+        ), hide_index=True, use_container_width=True)
+
+    # config
+    st.subheader("Configuration")
+    n_components = st.number_input("Number of components", min_value=2, max_value=40, value=5, step=1, key="w_ncomp_ivffs")
+    n_experts = st.number_input("Number of experts", min_value=1, max_value=30, value=2, step=1, key="w_nexp_ivffs")
+
+    component_names = []
+    cols = st.columns(min(5, n_components))
+    for i in range(n_components):
+        with cols[i % len(cols)]:
+            component_names.append(st.text_input(f"Component {i+1}", value=f"C{i+1}", key=f"w_comp_ivffs_{i}"))
+
+    st.markdown("### Expert weights")
+    if n_experts == 1:
+        expert_weights = [1.0]
+        st.success("Single expert → weight = 1.0")
+    else:
+        expert_weights = []
+        ecols = st.columns(min(6, n_experts))
+        for e in range(n_experts):
+            with ecols[e % len(ecols)]:
+                expert_weights.append(
+                    st.number_input(
+                        f"E{e+1}",
+                        min_value=0.0, max_value=1.0,
+                        value=round(1 / n_experts, 5),
+                        step=0.00001,
+                        format="%.5f",
+                        key=f"w_expw_ivffs_{e}"
+                    )
+                )
+        if not np.isclose(sum(expert_weights), 1.0):
+            st.error(f"Expert weights must sum to 1.0 (now: {sum(expert_weights):.6f}).")
+            return
+
+    # editors per expert
+    st.subheader("Expert inputs")
+
+    tabs = st.tabs([f"Expert {e+1}" for e in range(n_experts)])
+    strengths_by_expert = []
+    influence_by_expert = []
+
+    strength_terms = list(strength_scale.keys())
+    influence_terms = list(influence_scale.keys())
+
+    for e in range(n_experts):
+        with tabs[e]:
+            st.markdown("#### Strength (diagonal)")
+            srow = []
+            scol = st.columns(min(6, n_components))
+            for i in range(n_components):
+                with scol[i % len(scol)]:
+                    term = st.selectbox(
+                        f"{component_names[i]} strength",
+                        options=strength_terms,
+                        index=strength_terms.index("HR") if "HR" in strength_terms else 0,
+                        key=f"w_strength_{e}_{i}"
+                    )
+                    srow.append(strength_scale[term])
+            strengths_by_expert.append(srow)
+
+            st.markdown("#### Influence matrix (row influences column)")
+            mat = [[make_ivff(0, 0, 0, 0) for _ in range(n_components)] for _ in range(n_components)]
+            for i in range(n_components):
+                row_cols = st.columns(min(6, n_components))
+                for j in range(n_components):
+                    with row_cols[j % len(row_cols)]:
+                        if i == j:
+                            st.markdown("—")
+                            mat[i][j] = strength_scale.get("HR", srow[i])
+                        else:
+                            term = st.selectbox(
+                                f"{component_names[i]}→{component_names[j]}",
+                                options=influence_terms,
+                                index=influence_terms.index("ELI") if "ELI" in influence_terms else 0,
+                                key=f"w_infl_{e}_{i}_{j}"
+                            )
+                            mat[i][j] = influence_scale[term]
+            influence_by_expert.append(mat)
+
+    if st.button("🚀 Run IVFFS–WINGS", type="primary", use_container_width=True, key="run_ivffs_wings"):
+        with st.spinner("Computing WINGS..."):
+            res = wings_compute(component_names, strengths_by_expert, influence_by_expert, expert_weights)
+
+        st.success("Done.")
+
+        out = res["out"]
+
+        st.subheader("Results table (TI / TR / Engagement / Role / Expected value / Weight)")
+        # FIX: Use safe_numeric_style (prevents your ValueError crash)
+        st.dataframe(safe_numeric_style(out, precision=6), use_container_width=True, hide_index=True)
+
+        with st.expander("Matrices (crisp)"):
+            st.write("Direct matrix D (expected values)")
+            st.dataframe(pd.DataFrame(res["D"], index=component_names, columns=component_names).round(6), use_container_width=True)
+            st.write("Normalized matrix X")
+            st.dataframe(pd.DataFrame(res["X"], index=component_names, columns=component_names).round(6), use_container_width=True)
+            st.write("Total relation matrix T")
+            st.dataframe(pd.DataFrame(res["T"], index=component_names, columns=component_names).round(6), use_container_width=True)
+
+        st.subheader("Export")
+        doc = make_word_report_wings(out)
+        st.markdown(word_download_link(doc), unsafe_allow_html=True)
+
+        # store weights for TODIM module
+        st.session_state["wings_weights"] = out[["Component", "Weight"]].copy()
+
+
+# =========================================================
+# UI: IVFFS–TODIM module
+# =========================================================
+def ivffs_todim_module():
+    st.header("📌 IVFFS–TODIM")
+
+    st.info("If you ran IVFFS–WINGS already, TODIM can auto-load criterion weights from WINGS output.")
+
+    up = st.file_uploader("Upload Excel (same template, to load TODIM linguistic scale)", type=["xlsx"], key="todim_excel")
+    if up is None:
+        st.warning("Upload the Excel template to proceed.")
+        return
+
+    try:
+        scales = load_scales_from_excel(up)
+    except Exception as e:
+        st.error(f"Could not read scales from Excel: {e}")
+        return
+
+    todim_scale = scales["todim"]
+    if len(todim_scale) == 0:
+        # fallback: reuse influence if needed
+        todim_scale = scales["influence"]
+
+    st.subheader("Define Alternatives and Criteria")
+    c1, c2 = st.columns(2)
+    alts_in = c1.text_input("Alternatives (comma-separated)", "A1, A2, A3", key="todim_alts")
+    crits_in = c2.text_input("Criteria (comma-separated)", "C1, C2, C3", key="todim_crits")
+
+    alternatives = [a.strip() for a in alts_in.split(",") if a.strip()]
+    criteria = [c.strip() for c in crits_in.split(",") if c.strip()]
+    if len(alternatives) < 2 or len(criteria) < 1:
+        st.warning("Provide at least 2 alternatives and 1 criterion.")
+        return
+
+    # Weights table (allow 5 digits + smaller step)
+    st.markdown("### Criteria types and weights")
+
+    # if WINGS weights exist, auto-fill
+    wings_w = st.session_state.get("wings_weights", None)
+    default_w = [round(1 / len(criteria), 5)] * len(criteria)
+    if len(criteria) > 0:
+        default_w[-1] = round(1.0 - sum(default_w[:-1]), 5)
+
+    if wings_w is not None:
+        # map by name if possible
+        w_map = dict(zip(wings_w["Component"], wings_w["Weight"]))
+        default_w = [float(w_map.get(c, default_w[i])) for i, c in enumerate(criteria)]
+        # re-normalize
+        s = sum(default_w)
+        default_w = [x / s for x in default_w] if s != 0 else default_w
+
+    if "todim_crit_df" not in st.session_state or set(st.session_state["todim_crit_df"]["Criterion"]) != set(criteria):
+        st.session_state["todim_crit_df"] = pd.DataFrame({
             "Criterion": criteria,
             "Type": ["Benefit"] * len(criteria),
-            "Weight": w0
+            "Weight": default_w
         })
 
     edited = st.data_editor(
-        st.session_state["t_crit_df"],
+        st.session_state["todim_crit_df"],
         hide_index=True,
         use_container_width=True,
         column_config={
-            "Type": st.column_config.SelectboxColumn("Type", options=["Benefit","Cost"]),
-            "Weight": st.column_config.NumberColumn("Weight", min_value=0.0, max_value=1.0, step=0.00001, format="%.6f")
+            "Type": st.column_config.SelectboxColumn("Type", options=["Benefit", "Cost"]),
+            # FIX: allow 5 digits + tiny step
+            "Weight": st.column_config.NumberColumn("Weight", format="%.5f", min_value=0.0, max_value=1.0, step=0.00001),
         },
-        key="t_crit_editor"
+        key="todim_crit_editor"
     )
-    crit_types = edited["Type"].tolist()
-    crit_w = edited["Weight"].astype(float).tolist()
 
-    # Option: use weights from WINGS
-    use_wings = st.checkbox("Use weights computed from IVFFS–WINGS (if available)", value=False)
-    if use_wings and "wings_weights" in st.session_state:
-        wings_w = st.session_state["wings_weights"]
-        if len(wings_w) == len(criteria):
-            crit_w = list(map(float, wings_w))
-            st.info("Using WINGS weights for TODIM.")
-        else:
-            st.warning("WINGS weights exist, but their length != number of criteria here. Using manual weights.")
-
-    if not np.isclose(sum(crit_w), 1.0):
-        st.error(f"Criteria weights must sum to 1.0 (now {sum(crit_w):.6f}).")
+    w = edited["Weight"].astype(float).to_numpy()
+    if not np.isclose(w.sum(), 1.0):
+        st.error(f"Criteria weights must sum to 1.0 (now: {w.sum():.6f}).")
         return
 
-    # TODIM linguistic scale editor
-    st.subheader("TODIM linguistic scale (editable)")
-    df_tscale = st.data_editor(
-        scale_dict_to_df(st.session_state.get("t_scale", DEFAULT_TODIM_SCALE)),
-        hide_index=True,
-        use_container_width=True,
-        key="t_scale_editor"
-    )
-    t_scale = df_to_scale_dict(df_tscale)
-    st.session_state["t_scale"] = t_scale
+    types = edited["Type"].tolist()
 
-    # Experts
-    nexp = st.number_input("Number of experts", min_value=1, max_value=30, value=4, step=1)
-    st.markdown("**Expert weights (sum=1)**")
-    if nexp == 1:
-        exp_w = [1.0]
-        st.info("Single expert → weight = 1.0")
+    st.subheader("Experts and evaluations")
+    n_experts = st.number_input("Number of experts", min_value=1, max_value=30, value=2, step=1, key="todim_nexp")
+
+    st.markdown("**Expert weights** (sum to 1)")
+    if n_experts == 1:
+        ew = [1.0]
+        st.success("Single expert → weight = 1.0")
     else:
-        exp_w = []
-        cols = st.columns(min(6, nexp))
-        for e in range(nexp):
-            with cols[e % len(cols)]:
-                exp_w.append(st.number_input(f"E{e+1}", min_value=0.0, max_value=1.0, value=round(1/nexp, 4), step=0.01, key=f"t_expw_{e}"))
-        if not np.isclose(sum(exp_w), 1.0):
-            st.error(f"Expert weights must sum to 1.0 (now {sum(exp_w):.6f}).")
+        ew = []
+        cols = st.columns(min(6, n_experts))
+        for i in range(n_experts):
+            with cols[i % len(cols)]:
+                ew.append(
+                    st.number_input(
+                        f"E{i+1}",
+                        min_value=0.0, max_value=1.0,
+                        value=round(1 / n_experts, 5),
+                        step=0.00001,
+                        format="%.5f",
+                        key=f"todim_ew_{i}"
+                    )
+                )
+        if not np.isclose(sum(ew), 1.0):
+            st.error(f"Expert weights must sum to 1.0 (now: {sum(ew):.6f}).")
             return
 
-    alpha = st.number_input("Dombi parameter α (aggregation)", min_value=0.1, max_value=20.0, value=2.0, step=0.1, key="t_alpha")
-    xi = st.number_input("Attenuation factor ξ", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+    term_list = list(todim_scale.keys())
+    with st.expander("TODIM linguistic scale loaded", expanded=False):
+        st.dataframe(
+            pd.DataFrame([{"abbr": k, "ivff": ivff_to_str(v, 4)} for k, v in todim_scale.items()]),
+            hide_index=True,
+            use_container_width=True
+        )
 
-    # Decision matrices per expert (linguistic)
-    if "t_expert_dfs" not in st.session_state:
-        st.session_state["t_expert_dfs"] = {}
+    # editors per expert: alternatives x criteria linguistic
+    if "todim_expert_tables" not in st.session_state:
+        st.session_state["todim_expert_tables"] = {}
 
     need_reset = (
-        len(st.session_state["t_expert_dfs"]) != nexp
-        or (nexp > 0 and (
-            set(st.session_state["t_expert_dfs"].get(0, pd.DataFrame()).index) != set(alternatives)
-            or set(st.session_state["t_expert_dfs"].get(0, pd.DataFrame()).columns) != set(criteria)
+        len(st.session_state["todim_expert_tables"]) != n_experts
+        or (n_experts > 0 and (
+            set(st.session_state["todim_expert_tables"].get(0, pd.DataFrame()).index) != set(alternatives)
+            or set(st.session_state["todim_expert_tables"].get(0, pd.DataFrame()).columns) != set(criteria)
         ))
     )
     if need_reset:
-        st.session_state["t_expert_dfs"] = {
-            e: pd.DataFrame("F", index=alternatives, columns=criteria) for e in range(nexp)
+        st.session_state["todim_expert_tables"] = {
+            e: pd.DataFrame(term_list[0], index=alternatives, columns=criteria) for e in range(n_experts)
         }
 
-    st.subheader("Expert evaluations (linguistic)")
-    tabs = st.tabs([f"Expert {e+1}" for e in range(nexp)])
-    for e, tab in enumerate(tabs):
-        with tab:
-            st.session_state["t_expert_dfs"][e] = st.data_editor(
-                st.session_state["t_expert_dfs"][e],
+    tabs = st.tabs([f"Expert {e+1}" for e in range(n_experts)])
+    for e in range(n_experts):
+        with tabs[e]:
+            st.session_state["todim_expert_tables"][e] = st.data_editor(
+                st.session_state["todim_expert_tables"][e],
                 use_container_width=True,
-                column_config={c: st.column_config.SelectboxColumn(c, options=list(t_scale.keys())) for c in criteria},
-                key=f"t_editor_{e}"
+                column_config={
+                    c: st.column_config.SelectboxColumn(c, options=term_list) for c in criteria
+                },
+                key=f"todim_editor_{e}"
             )
 
-    if st.button("✅ Run IVFFS–TODIM", type="primary", use_container_width=True):
-        # Step 3.2: Aggregate decision matrix S using IVFFDWA (by cell)
-        agg = {}
-        for a in alternatives:
-            for j, c in enumerate(criteria):
-                cell_ivffs = []
-                for e in range(nexp):
-                    term = st.session_state["t_expert_dfs"][e].loc[a, c]
-                    cell_ivffs.append(t_scale[term])
-                agg[(a, c)] = ivffdwa_aggregate(cell_ivffs, exp_w, alpha=alpha)
+    st.subheader("Run TODIM")
+    theta = st.number_input("θ (theta) loss attenuation", min_value=0.01, max_value=20.0, value=1.0, step=0.1, key="todim_theta")
+    alpha = st.number_input("α (alpha) gain/loss exponent", min_value=0.1, max_value=5.0, value=1.0, step=0.1, key="todim_alpha")
 
-        # Step 3.3: Normalize by benefit/cost (swap for cost)
-        norm = {}
-        for j, c in enumerate(criteria):
-            for a in alternatives:
-                norm[(a, c)] = normalize_ivffs_benefit_cost(agg[(a, c)], crit_types[j])
+    if st.button("✅ Run IVFFS–TODIM", type="primary", use_container_width=True, key="run_todim"):
+        with st.spinner("Computing TODIM..."):
+            # Aggregate decision matrix in IVFF domain
+            agg = [[None for _ in criteria] for _ in alternatives]
+            for i, alt in enumerate(alternatives):
+                for j, crit in enumerate(criteria):
+                    ivffs = []
+                    for e in range(n_experts):
+                        term = st.session_state["todim_expert_tables"][e].loc[alt, crit]
+                        ivffs.append(todim_scale[term])
+                    agg[i][j] = ivff_weighted_aggregate(ivffs, ew)
 
-        # Step 3.4: Score matrix τ
-        tau = pd.DataFrame(index=alternatives, columns=criteria, dtype=float)
-        for a in alternatives:
-            for c in criteria:
-                tau.loc[a, c] = ivffs_score(norm[(a, c)])
+            agg_df = pd.DataFrame(
+                [[ivff_to_str(agg[i][j], 4) for j in range(len(criteria))] for i in range(len(alternatives))],
+                index=alternatives, columns=criteria
+            )
+            st.markdown("#### Aggregated IVFF decision matrix")
+            st.dataframe(agg_df, use_container_width=True)
 
-        # Step 3.5: Relative weights ω'_j = ω_j / ω_r, ω_r = max ω
-        omega = np.array(crit_w, dtype=float)
-        omega_r = float(np.max(omega)) if float(np.max(omega)) > EPS else 1.0
-        omega_rel = omega / omega_r
+            # Defuzzify to crisp scores for TODIM
+            # Use score shifted to [0,1]
+            crisp = np.zeros((len(alternatives), len(criteria)), dtype=float)
+            for i in range(len(alternatives)):
+                for j in range(len(criteria)):
+                    s = score_ivff(agg[i][j])      # [-1,1] approx
+                    crisp[i, j] = (s + 1.0) / 2.0  # -> [0,1]
 
-        denom_sumw = float(np.sum(omega)) if float(np.sum(omega)) > EPS else 1.0
+            crisp_df = pd.DataFrame(crisp, index=alternatives, columns=criteria)
+            st.markdown("#### Crisp matrix (score shifted to [0,1])")
+            st.dataframe(crisp_df.round(6), use_container_width=True)
 
-        # Step 3.6-3.8: dominance ψj, overall superiority Φ, comprehensive Υ, normalized Υ*
-        m = len(alternatives)
-        ncrit = len(criteria)
-
-        # dominance per pair
-        Phi = np.zeros((m, m), dtype=float)
-
-        for i in range(m):
-            for q in range(m):
-                if i == q:
-                    continue
-                si = alternatives[i]
-                sq = alternatives[q]
-
-                total = 0.0
-                for j, c in enumerate(criteria):
-                    tij = float(tau.loc[si, c])
-                    tqj = float(tau.loc[sq, c])
-                    d = todim_distance(tij, tqj)
-
-                    if tij > tqj + 1e-15:
-                        part = math.sqrt((omega_rel[j] / denom_sumw) * d)
-                    elif abs(tij - tqj) <= 1e-15:
-                        part = 0.0
+            # Normalize by type (Benefit/Cost) to [0,1]
+            norm = crisp.copy()
+            for j in range(len(criteria)):
+                col = norm[:, j]
+                mn, mx = float(np.min(col)), float(np.max(col))
+                if mx - mn == 0:
+                    norm[:, j] = 0.0
+                else:
+                    if str(types[j]).lower().startswith("b"):
+                        norm[:, j] = (col - mn) / (mx - mn)
                     else:
-                        part = - (1.0 / float(xi)) * math.sqrt((omega_rel[j] / denom_sumw) * d)
+                        norm[:, j] = (mx - col) / (mx - mn)
 
-                    total += part
+            norm_df = pd.DataFrame(norm, index=alternatives, columns=criteria)
+            st.markdown("#### Normalized matrix for TODIM")
+            st.dataframe(norm_df.round(6), use_container_width=True)
 
-                Phi[i, q] = total
+            phi, xi = todim_rank(norm, w, theta=theta, alpha=alpha)
 
-        Upsilon = np.sum(Phi, axis=1)  # comprehensive superiority
-        umin = float(np.min(Upsilon))
-        umax = float(np.max(Upsilon))
-        if abs(umax - umin) < EPS:
-            U_norm = np.zeros_like(Upsilon)
-        else:
-            U_norm = (Upsilon - umin) / (umax - umin)
+            res_df = pd.DataFrame({
+                "Alternative": alternatives,
+                "Phi (dominance sum)": phi,
+                "Xi (normalized value)": xi
+            }).sort_values("Xi (normalized value)", ascending=False).reset_index(drop=True)
 
-        res = pd.DataFrame({
-            "Alternative": alternatives,
-            "Υ (comprehensive)": Upsilon,
-            "Υ* (normalized)": U_norm
-        }).sort_values("Υ* (normalized)", ascending=False).reset_index(drop=True)
+            res_df["Rank"] = np.arange(1, len(res_df) + 1)
 
-        res["Rank"] = np.arange(1, len(res) + 1)
-
-        st.success("TODIM computed.")
-
-        with st.expander("Aggregated IVFFS decision matrix (S)", expanded=False):
-            dfS = pd.DataFrame(index=alternatives, columns=criteria, dtype=object)
-            for a in alternatives:
-                for c in criteria:
-                    dfS.loc[a, c] = ivffs_str(agg[(a, c)])
-            st.dataframe(dfS, use_container_width=True)
-
-        with st.expander("Normalized IVFFS decision matrix (η)", expanded=False):
-            dfN = pd.DataFrame(index=alternatives, columns=criteria, dtype=object)
-            for a in alternatives:
-                for c in criteria:
-                    dfN.loc[a, c] = ivffs_str(norm[(a, c)])
-            st.dataframe(dfN, use_container_width=True)
-
-        st.subheader("Score matrix τ")
-        st.dataframe(tau.style.format("{:.6f}"), use_container_width=True)
-
-        st.subheader("Dominance matrix Φ(Si,Sq)")
-        st.dataframe(pd.DataFrame(Phi, index=alternatives, columns=alternatives).style.format("{:.6f}"), use_container_width=True)
-
-        st.subheader("Final ranking (Υ*)")
-        st.dataframe(res.style.format({"Υ (comprehensive)": "{:.6f}", "Υ* (normalized)": "{:.6f}"}), use_container_width=True, hide_index=True)
-
-        # downloads
-        csv1 = tau.reset_index().rename(columns={"index": "Alternative"}).to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download TODIM τ matrix (CSV)", data=csv1, file_name="ivffs_todim_tau.csv", mime="text/csv")
-        csv2 = res.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download TODIM ranking (CSV)", data=csv2, file_name="ivffs_todim_ranking.csv", mime="text/csv")
+            st.markdown("#### TODIM final ranking")
+            st.dataframe(safe_numeric_style(res_df, precision=6), use_container_width=True, hide_index=True)
 
 
 # =========================================================
-# Main App (Two modules)
+# Main app navigation
 # =========================================================
-
 def main():
     st.set_page_config(page_title="IVFFS Toolkit (WINGS + TODIM)", layout="wide")
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Choose a Module", ["IVFFS–WINGS", "IVFFS–TODIM"])
+    page = st.sidebar.radio("Choose module", ["IVFFS–WINGS", "IVFFS–TODIM"])
 
     if page == "IVFFS–WINGS":
         ivffs_wings_module()
     else:
         ivffs_todim_module()
+
 
 if __name__ == "__main__":
     main()
