@@ -9,7 +9,7 @@ import base64
 import matplotlib.pyplot as plt
 
 # =========================================================
-# Helpers: safe numeric styling (fixes Streamlit Styler crash)
+# Helpers: safe numeric styling (prevents Streamlit Styler crash)
 # =========================================================
 def st_dataframe_numeric_format(df: pd.DataFrame, precision: int = 6, **kwargs):
     """Safely format only numeric cols to avoid Streamlit pandas Styler ValueError."""
@@ -23,7 +23,6 @@ def st_dataframe_numeric_format(df: pd.DataFrame, precision: int = 6, **kwargs):
 # =========================================================
 # IVFFS representation (Interval-Valued Fermatean Fuzzy Set)
 #   We store: mu = [mu_l, mu_u], nu = [nu_l, nu_u]
-#   Fermatean constraint: mu^3 + nu^3 <= 1 (typically)
 # =========================================================
 def ivffs(mu_l, mu_u, nu_l, nu_u):
     return {"mu_l": float(mu_l), "mu_u": float(mu_u), "nu_l": float(nu_l), "nu_u": float(nu_u)}
@@ -31,22 +30,19 @@ def ivffs(mu_l, mu_u, nu_l, nu_u):
 def ivffs_str(x, nd=6):
     return f"([ {x['mu_l']:.{nd}f}, {x['mu_u']:.{nd}f} ], [ {x['nu_l']:.{nd}f}, {x['nu_u']:.{nd}f} ])"
 
-# =========================================================
-# Excel-matching IVFFS Dombi aggregation (Fermatean power = 3)
-#
-# Your Excel pattern for membership (for one bound):
-#   (1 - (1/(1 + ( Σ w_i * ((μ_i^3/(1-μ_i^3))^λ) )^(1/λ) ))) )^(1/3)
-#
-# and for non-membership:
-#   (1/(1 + ( Σ w_i * (((1-ν_i^3)/ν_i^3)^λ) )^(1/λ) )))^(1/3)
-#
-# This matches how your sheet aggregates each parameter.
-# =========================================================
 _EPS = 1e-12
 
 def _safe_clip01(x):
     return float(min(1.0 - _EPS, max(_EPS, float(x))))
 
+# =========================================================
+# Excel-matching IVFFS Dombi aggregation (Fermatean power = 3)
+# Membership aggregation (for one bound):
+#   (1 - (1/(1 + ( Σ w_i * ((μ_i^3/(1-μ_i^3))^λ) )^(1/λ) ))) )^(1/3)
+#
+# Non-membership aggregation (for one bound):
+#   (1/(1 + ( Σ w_i * (((1-ν_i^3)/ν_i^3)^λ) )^(1/λ) )))^(1/3)
+# =========================================================
 def dombi_mu_agg(mu_list, w_list, lam):
     lam = float(lam)
     s = 0.0
@@ -86,9 +82,7 @@ def ivffs_dombi_aggregate(expert_ivffs_list, expert_weights, lam):
     return ivffs(agg_mu_l, agg_mu_u, agg_nu_l, agg_nu_u)
 
 # =========================================================
-# Expected value (matches your Excel pattern seen in sheet)
-# Example you shared / same structure in your workbook:
-#   EV = ( ((mu_l^3 + mu_u^3 - nu_l^3 - nu_u^3)/2) + 1 ) / 2
+# Expected value (kept same as before)
 # =========================================================
 def ivffs_expected_value(x):
     mu_l, mu_u = x["mu_l"], x["mu_u"]
@@ -98,8 +92,7 @@ def ivffs_expected_value(x):
     return float(ev)
 
 # =========================================================
-# TODIM (crisp on EV after aggregation)
-# - Normalize per criterion
+# TODIM normalization (crisp EV after aggregation)
 #   Benefit: x / max(x)
 #   Cost:    min(x) / x
 # =========================================================
@@ -112,7 +105,6 @@ def normalize_matrix_todim(ev_df: pd.DataFrame, crit_types: list):
             norm[c] = col / mx
         else:  # Cost
             mn = np.min(col)
-            # avoid division by zero
             norm[c] = np.array([mn / v if v != 0 else 0.0 for v in col], dtype=float)
     return norm
 
@@ -158,43 +150,41 @@ def todim_rank(norm_df: pd.DataFrame, weights: list, theta: float = 1.0):
     return delta, S, xi
 
 # =========================================================
-# Linguistic scale for IVFFS-TODIM (you can edit here)
-# If your Excel scale differs, paste your exact values below.
-# Format: "TERM": ivffs(mu_l, mu_u, nu_l, nu_u)
+# ✅ REVISED Linguistic scale for IVFFS-TODIM (YOUR PROVIDED)
 # =========================================================
 IVFFS_TODIM_SCALE = {
-    "VP": ivffs(0.00, 0.10, 0.80, 0.90),
-    "P":  ivffs(0.10, 0.30, 0.70, 0.80),
-    "MP": ivffs(0.30, 0.50, 0.50, 0.70),
-    "F":  ivffs(0.50, 0.70, 0.30, 0.50),
-    "MG": ivffs(0.70, 0.85, 0.15, 0.30),
-    "G":  ivffs(0.85, 0.95, 0.05, 0.15),
-    "VG": ivffs(0.95, 1.00, 0.00, 0.05),
+    "VP": ivffs(0.10, 0.15, 0.90, 0.95),
+    "P":  ivffs(0.20, 0.25, 0.80, 0.85),
+    "MP": ivffs(0.30, 0.35, 0.70, 0.75),
+    "F":  ivffs(0.50, 0.55, 0.40, 0.45),
+    "MG": ivffs(0.70, 0.75, 0.30, 0.35),
+    "G":  ivffs(0.80, 0.85, 0.20, 0.25),
+    "VG": ivffs(0.90, 0.95, 0.10, 0.15),
 }
 IVFFS_TODIM_FULL = {
-    "VP": "Very Poor", "P": "Poor", "MP": "Medium Poor", "F": "Fair",
-    "MG": "Medium Good", "G": "Good", "VG": "Very Good"
+    "VP": "Very Poor",
+    "P": "Poor",
+    "MP": "Medium Poor",
+    "F": "Fair",
+    "MG": "Medium Good",
+    "G": "Good",
+    "VG": "Very Good",
 }
 
 # =========================================================
 # MODULE 1: IVFFS-WINGS (simple expected-value WINGS-style)
-# NOTE: If your paper uses a different IVFFS-WINGS pipeline,
-# tell me the exact sheet name + key formulas and I’ll match it.
 # =========================================================
 def ivffs_wings_module():
     st.header("🪽 IVFFS–WINGS (Expected-Value Based)")
-    st.caption("This module computes TI/TR/Engagement/Role from an EV matrix (crisp after IVFFS expected value).")
+    st.caption("Computes TI/TR/Engagement/Role from a crisp matrix (expected-value style).")
 
     n = st.number_input("Number of factors", min_value=2, max_value=25, value=5, step=1)
     names = [st.text_input(f"Factor {i+1} name", value=f"F{i+1}") for i in range(int(n))]
 
     st.markdown("### Direct-influence matrix (Expected values, 0–1)")
-    st.info("If you want full IVFFS (interval) inputs for WINGS too, tell me your Excel sheet formulas and I will update it.")
-
     Z = pd.DataFrame(0.0, index=names, columns=names)
     Z = st.data_editor(Z, use_container_width=True, key="wings_Z")
 
-    # Normalize like DEMATEL/WINGS: Z / s where s = max(max row sum, max col sum)
     row_sum = Z.sum(axis=1).values
     col_sum = Z.sum(axis=0).values
     s = float(max(row_sum.max(), col_sum.max(), 1e-12))
@@ -220,7 +210,6 @@ def ivffs_wings_module():
         "Role": role,
     })
 
-    # Example “Expected value” and “Weight” (normalize Engagement)
     out["Expected value"] = (out["Engagement"] - out["Engagement"].min()) / (out["Engagement"].max() - out["Engagement"].min() + 1e-12)
     out["Weight"] = out["Expected value"] / (out["Expected value"].sum() + 1e-12)
 
@@ -228,13 +217,13 @@ def ivffs_wings_module():
     st_dataframe_numeric_format(out, precision=6, use_container_width=True, hide_index=True)
 
 # =========================================================
-# MODULE 2: IVFFS–TODIM (Excel-matching aggregation)
+# MODULE 2: IVFFS–TODIM (Excel-matching Dombi aggregation)
 # =========================================================
 def ivffs_todim_module():
     st.header("📊 IVFFS–TODIM (Excel-matching Dombi aggregation)")
-    st.caption("Aggregation is Dombi + Fermatean cube (matches your Excel formula). Defuzzification (EV) happens after aggregation.")
+    st.caption("Aggregation is Dombi + Fermatean cube (matches your Excel formula). Defuzzification (EV) after aggregation.")
 
-    with st.expander("Linguistic Scale (edit in code if needed)", expanded=False):
+    with st.expander("Linguistic Scale (VP…VG)", expanded=True):
         scale_df = pd.DataFrame([
             {"Abbr": k, "Meaning": IVFFS_TODIM_FULL.get(k, ""), "IVFFS": ivffs_str(v)}
             for k, v in IVFFS_TODIM_SCALE.items()
@@ -268,7 +257,6 @@ def ivffs_todim_module():
         use_container_width=True,
         column_config={
             "Type": st.column_config.SelectboxColumn("Type", options=["Benefit", "Cost"]),
-            # ✅ allows 5-digit weights
             "Weight": st.column_config.NumberColumn("Weight", format="%.5f", min_value=0.0, max_value=1.0, step=0.00001),
         },
         key="todim_crit_editor"
