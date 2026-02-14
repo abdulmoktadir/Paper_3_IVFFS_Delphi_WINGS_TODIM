@@ -418,7 +418,7 @@ def ivffs_todim_module():
         use_container_width=True,
         column_config={
             "Type": st.column_config.SelectboxColumn("Type", options=["Benefit","Cost"]),
-            "Weight": st.column_config.NumberColumn("Weight", min_value=0.0, max_value=1.0, step=0.0001, format="%.6f")
+            "Weight": st.column_config.NumberColumn("Weight", min_value=0.0, max_value=1.0, step=0.00001, format="%.6f")
         },
         key="t_crit_editor"
     )
